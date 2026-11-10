@@ -12,7 +12,23 @@ Latest versions
 `Upcoming release <https://github.com/robocorp/rpaframework/projects/3#column-16713994>`_
 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
-No changes planned yet for the next release.
+- ``rpaframework``: ``RPA.Browser.Selenium`` gained opt-in keywords for long-running,
+  multi-window collection flows that keep browser and window state isolated and make
+  failure cleanup and retries reliable, without changing any existing keyword behaviour:
+
+  - ``Save Browser State`` / ``Restore Browser State`` and the Python context managers
+    ``browser_window`` / ``browser_scope`` snapshot the active browser/window selection
+    and guarantee restoration even when the wrapped work fails, so a popup or a parallel
+    browser can no longer leak its page state into another flow.
+  - ``Switch To New Window`` discovers popup windows by diffing window handles,
+    ``Dismiss Any Alert`` clears a blocking dialog without failing when none is present,
+    and ``Close Window Safely`` / ``Close Browser Safely`` / ``Close All Browsers Safely``
+    never raise during teardown and force-stop unresponsive webdriver service processes
+    so no orphaned browser remains. ``Prune Dead Browsers`` detects crashed sessions.
+  - ``Run With Retry`` retries transient Selenium errors (with exponential backoff and a
+    per-retry cleanup hook) while failing fast on invalid selectors, and
+    ``Wait For Page Loaded`` / ``Go To Safely`` harden navigation across ordinary and
+    dynamically rendered pages.
 
 `Released <https://pypi.org/project/rpaframework/#history>`_
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++

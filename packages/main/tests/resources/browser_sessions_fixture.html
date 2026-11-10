@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Popup and dynamic page fixture</title>
+    <script>
+      // Dynamic content: the panel appears only after a delay, simulating a
+      // JS-rendered application.
+      window.addEventListener("load", function () {
+        setTimeout(function () {
+          var panel = document.createElement("div");
+          panel.id = "dynamic-panel";
+          panel.textContent = "rendered";
+          document.body.appendChild(panel);
+        }, 600);
+      });
+
+      function openPopup() {
+        var win = window.open("", "rpa-popup", "width=320,height=240");
+        win.document.write(
+          "<html><head><title>Popup Window</title></head>" +
+            "<body><p id='popup-marker'>popup content</p></body></html>"
+        );
+        win.document.close();
+      }
+
+      function openAlert() {
+        setTimeout(function () {
+          window.alert("blocking dialog");
+        }, 100);
+      }
+    </script>
+  </head>
+  <body>
+    <h1 id="main-title">Main page</h1>
+    <button id="open-popup" onclick="openPopup()">Open popup</button>
+    <button id="open-alert" onclick="openAlert()">Open alert</button>
+    <a id="same-page-link" href="#anchor">navigate</a>
+  </body>
+</html>

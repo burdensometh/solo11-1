@@ -47,6 +47,7 @@ from SeleniumLibrary.keywords.webdrivertools import SeleniumOptions, WebDriverCr
 from SeleniumLibrary.locators import ElementFinder
 
 from RPA.Browser.common import AUTO, auto_headless
+from RPA.Browser.sessions import SessionKeywords
 from RPA.core import notebook
 from RPA.core import webdriver as core_webdriver
 from RPA.core.locators import BrowserLocator, LocatorsDatabase
@@ -257,13 +258,16 @@ class Selenium(SeleniumLibrary):
         super().__init__(*args, **kwargs)
         self._element_finder = RobocorpElementFinder(self)
 
+        self.logger = logging.getLogger(__name__)
+
         # Add inherit/overridden library keywords.
         self.browser_management = BrowserManagementKeywords(self)
         window_kw = WindowKeywords(self)
-        override_plugins = [self.browser_management, window_kw]
+        # Isolated multi-window sessions, reliable cleanup and retries.
+        self.sessions = SessionKeywords(self)
+        override_plugins = [self.browser_management, window_kw, self.sessions]
         self.add_library_components(override_plugins)
 
-        self.logger = logging.getLogger(__name__)
         self.using_testability = bool("SeleniumTestability" in plugins)
 
         # Add support for locator aliases.
@@ -309,6 +313,18 @@ class Selenium(SeleniumLibrary):
                     driver.quit()  # quits the browser as well
             except Exception as exc:  # pylint: disable=broad-except
                 self.logger.warning("Encountered error during auto-close: %s", exc)
+                if driver_only:
+                    # The driver process kill itself failed; nothing more can be
+                    #  done without touching the browser window.
+                    continue
+                # A dead/unresponsive driver must still release its service
+                #  process, otherwise the browser lingers after the task ends.
+                try:
+                    self.sessions._force_stop(driver)  # pylint: disable=protected-access
+                except Exception as stop_exc:  # pylint: disable=broad-except
+                    self.logger.warning(
+                        "Force-stopping driver also failed: %s", stop_exc
+                    )
 
     @property
     def location(self) -> str:
