@@ -67,3 +67,12 @@ gh_runs/*
 
 # AI stuff
 **/settings.local.json
+
+# Local credentials and connection material
+.env
+.env.*
+!.env.example
+**/*secret*.json
+**/*token*.json
+**/*credential*.json
+**/*apikey*
