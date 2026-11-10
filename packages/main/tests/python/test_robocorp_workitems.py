@@ -47,6 +47,10 @@ VALID_FILES = {
     IN_OUT_ID: {},
 }
 ITEMS_JSON = [{"payload": {"a-key": "a-value"}, "files": {"a-file": "file.txt"}}]
+ITEMS_JSON_MULTI = [
+    {"payload": {"var": "first"}, "files": {}},
+    {"payload": {"var": "second"}, "files": {}},
+]
 FAILURE_ATTRIBUTES = {"status": "FAIL", "message": "The task/suite has failed"}
 
 OUTPUT_DIR = RESULTS_DIR / "output_dir"
@@ -237,6 +241,68 @@ class TestLibrary:
         library.save_work_item()
         for key, value in modified.items():
             MockAdapter.validate(item, key, value)
+
+    def test_save_work_item_retries_only_unsaved_files(self, library, monkeypatch):
+        item = library.get_input_work_item()
+        with temp_filename(b"content-1") as path1, temp_filename(
+            b"content-2"
+        ) as path2:
+            library.add_work_item_file(path1, "file4.txt")
+            library.add_work_item_file(path2, "file5.txt")
+
+            attempts = []
+            original_add_file = MockAdapter.add_file
+
+            def flaky_add_file(self, item_id, name, *, original_name, content):
+                attempts.append(name)
+                if name == "file5.txt" and attempts.count(name) == 1:
+                    raise RuntimeError("interrupted upload")
+                return original_add_file(
+                    self, item_id, name, original_name=original_name, content=content
+                )
+
+            monkeypatch.setattr(MockAdapter, "add_file", flaky_add_file)
+
+            with pytest.raises(RuntimeError, match="interrupted upload"):
+                library.save_work_item()
+            # The first file got confirmed, the second one is still pending.
+            assert "file4.txt" in MockAdapter.FILES[item.id]
+            assert "file5.txt" not in MockAdapter.FILES[item.id]
+
+            library.save_work_item()  # retrying resumes where it stopped
+            assert attempts == ["file4.txt", "file5.txt", "file5.txt"]
+            assert MockAdapter.FILES[item.id]["file5.txt"] == b"content-2"
+
+    def test_autorelease_failure_does_not_propagate(self, library, monkeypatch):
+        library.get_input_work_item()
+
+        def failing_release(item_id, state, exception=None):
+            raise RuntimeError("cloud is down")
+
+        monkeypatch.setattr(library.adapter, "release_input", failing_release)
+
+        # The release error is logged and the item left pending for a later
+        #  retry instead of masking the original task failure.
+        library._end_test("My Failure Name", FAILURE_ATTRIBUTES)
+        assert library.current.state is None
+
+    def test_resume_with_file_adapter(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as datadir:
+            items_in = os.path.join(datadir, "items.json")
+            with open(items_in, "w") as fd:
+                json.dump(ITEMS_JSON_MULTI, fd)
+            monkeypatch.setenv("RPA_INPUT_WORKITEM_PATH", items_in)
+
+            library = WorkItems(default_adapter=FileAdapter)
+            first = library.get_input_work_item()
+            assert first.payload["var"] == "first"
+            library.release_input_work_item(State.DONE)
+
+            # A new library instance (e.g. process restart) continues with the
+            #  next pending item instead of starting over.
+            library = WorkItems(default_adapter=FileAdapter)
+            second = library.get_input_work_item()
+            assert second.payload["var"] == "second"
 
     def test_no_active_item(self):
         library = WorkItems(default_adapter=MockAdapter)
@@ -890,7 +956,9 @@ class TestFileAdapter:
         assert os.path.isfile(output)
         with open(output) as fd:
             data = json.load(fd)
-            assert data == [{"payload": {"key": "value"}, "files": {}}]
+            assert data == [
+                {"payload": {"key": "value"}, "files": {}, "parentId": "0"}
+            ]
 
     def test_missing_file(self, monkeypatch):
         monkeypatch.setenv("RPA_WORKITEMS_PATH", "not-exist.json")
@@ -927,6 +995,107 @@ class TestFileAdapter:
             _ = empty_adapter.output_path
         with pytest.raises(RuntimeError):
             empty_adapter.create_output("1", {"var": "some-value"})
+
+    @contextmanager
+    def _work_items_file(self, items):
+        with tempfile.TemporaryDirectory() as datadir:
+            items_in = os.path.join(datadir, "items.json")
+            with open(items_in, "w") as fd:
+                json.dump(items, fd)
+            yield items_in
+
+    def test_release_persists_state_and_resumes(self, monkeypatch):
+        with self._work_items_file(ITEMS_JSON_MULTI) as items_in:
+            monkeypatch.setenv("RPA_INPUT_WORKITEM_PATH", items_in)
+
+            adapter = FileAdapter()
+            assert adapter.reserve_input() == "0"
+            adapter.release_input("0", State.DONE)
+
+            # A new adapter over the same input file (e.g. after a restart)
+            #  skips the already completed item and continues with the next.
+            adapter = FileAdapter()
+            assert adapter.reserve_input() == "1"
+            adapter.release_input("1", State.DONE)
+
+            # Everything is completed, so the queue is considered empty.
+            adapter = FileAdapter()
+            with pytest.raises(EmptyQueue):
+                adapter.reserve_input()
+
+    def test_interrupted_item_is_reserved_again(self, monkeypatch):
+        with self._work_items_file(ITEMS_JSON_MULTI) as items_in:
+            monkeypatch.setenv("RPA_INPUT_WORKITEM_PATH", items_in)
+
+            adapter = FileAdapter()
+            assert adapter.reserve_input() == "0"
+            # The run is interrupted before the item gets released.
+
+            # The next run doesn't skip the still pending item.
+            adapter = FileAdapter()
+            assert adapter.reserve_input() == "0"
+
+    def test_failed_item_retry_depends_on_error_type(self, monkeypatch):
+        with self._work_items_file(ITEMS_JSON_MULTI) as items_in:
+            monkeypatch.setenv("RPA_INPUT_WORKITEM_PATH", items_in)
+
+            adapter = FileAdapter()
+            adapter.release_input(
+                adapter.reserve_input(),
+                State.FAILED,
+                exception={"type": "APPLICATION", "code": "ERR", "message": "boom"},
+            )
+
+            # Transient application errors are retried on the next run.
+            adapter = FileAdapter()
+            assert adapter.reserve_input() == "0"
+            adapter.release_input(
+                "0",
+                State.FAILED,
+                exception={"type": "BUSINESS", "code": "BAD_DATA"},
+            )
+
+            # Business errors are considered settled and not served again.
+            adapter = FileAdapter()
+            assert adapter.reserve_input() == "1"
+
+    def test_outputs_are_not_duplicated_on_retry(self, monkeypatch):
+        with self._work_items_file(ITEMS_JSON_MULTI) as items_in:
+            monkeypatch.setenv("RPA_INPUT_WORKITEM_PATH", items_in)
+            output_path = Path(items_in).with_suffix(".output.json")
+
+            adapter = FileAdapter()
+            item_id = adapter.reserve_input()
+            output_id = adapter.create_output(item_id, {"result": 1})
+            # The run is interrupted before the input could be released.
+
+            adapter = FileAdapter()
+            assert adapter.reserve_input() == item_id  # same input again
+            retry_id = adapter.create_output(item_id, {"result": 1})
+            assert retry_id == output_id  # previous output got reused
+            adapter.release_input(item_id, State.DONE)
+
+            with open(output_path) as fd:
+                outputs = json.load(fd)
+            assert outputs == [
+                {"payload": {"result": 1}, "files": {}, "parentId": item_id}
+            ]
+
+    def test_resume_disabled_starts_over(self, monkeypatch):
+        with self._work_items_file(ITEMS_JSON_MULTI) as items_in:
+            monkeypatch.setenv("RPA_INPUT_WORKITEM_PATH", items_in)
+            monkeypatch.setenv("RPA_WORKITEMS_RESUME", "0")
+
+            adapter = FileAdapter()
+            adapter.release_input(adapter.reserve_input(), State.DONE)
+
+            # With resuming disabled, every run starts from the beginning and
+            #  no state is persisted.
+            adapter = FileAdapter()
+            assert adapter.reserve_input() == "0"
+            with open(items_in) as fd:
+                inputs = json.load(fd)
+            assert all("state" not in item for item in inputs)
 
 
 class TestRobocorpAdapter:
@@ -985,12 +1154,55 @@ class TestRobocorpAdapter:
         initial_item_id = adapter.reserve_input()
         assert initial_item_id == self.ENV["RC_WORKITEM_ID"]
 
+        # Reserving again without releasing first returns the same still
+        #  in-progress item instead of skipping ahead.
+        assert adapter.reserve_input() == initial_item_id
+        self.mock_post.assert_not_called()
+
+        adapter.release_input(initial_item_id, State.DONE)
+
         self.mock_post.return_value.json.return_value = {"workItemId": "44"}
         reserved_item_id = adapter.reserve_input()
         assert reserved_item_id == "44"
 
         url = "https://api.process.com/process-v1/workspaces/1/processes/5/runs/2/robotRuns/3/reserve-next-work-item"
-        self.mock_post.assert_called_once_with(url, headers=self.HEADERS_PROCESS)
+        self.mock_post.assert_called_with(url, headers=self.HEADERS_PROCESS)
+
+    def test_reserve_input_empty_queue(self, adapter):
+        adapter.release_input(adapter.reserve_input(), State.DONE)
+        self.mock_post.return_value.json.return_value = {"workItemId": None}
+        with pytest.raises(EmptyQueue):
+            adapter.reserve_input()
+
+    def test_release_input_already_released(self, adapter):
+        item_id = adapter.reserve_input()
+        self.mock_post.side_effect = RequestsHTTPError(
+            status_code=409, status_message="Conflict"
+        )
+
+        # Doesn't raise even though the item was already released remotely.
+        adapter.release_input(item_id, State.DONE)
+        assert self.mock_post.call_count == 1  # no retrying on conflicts
+
+        # And the item is considered released, so a new one can be reserved.
+        self.mock_post.side_effect = None
+        self.mock_post.return_value.json.return_value = {"workItemId": "44"}
+        assert adapter.reserve_input() == "44"
+
+    def test_release_input_error_keeps_item_reserved(self, adapter):
+        item_id = adapter.reserve_input()
+        self.mock_post.side_effect = RequestsHTTPError(
+            status_code=500, status_message="Error"
+        )
+
+        with pytest.raises(RequestsHTTPError):
+            adapter.release_input(item_id, State.DONE)
+        assert self.mock_post.call_count == 5  # server errors are retried
+
+        # The item is still considered reserved, so it gets returned again
+        #  instead of reserving a new one and skipping it.
+        self.mock_post.side_effect = None
+        assert adapter.reserve_input() == item_id
 
     @pytest.mark.parametrize(
         "exception",

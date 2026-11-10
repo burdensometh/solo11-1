@@ -1,3 +1,4 @@
+# pylint: disable=too-many-lines
 import copy
 import email
 import fnmatch
@@ -5,11 +6,12 @@ import json
 import logging
 import os
 from abc import ABC, abstractmethod
+from collections import defaultdict, deque
 from enum import Enum
 from pathlib import Path
 from shutil import copy2
 from threading import Event
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Type, Union
 
 import yaml
 from robot.api.deco import keyword, library
@@ -22,6 +24,7 @@ from RPA.FileSystem import FileSystem
 from RPA.Robocorp.utils import (
     JSONType,
     Requests,
+    RequestsHTTPError,
     get_dot_value,
     is_json_equal,
     json_dumps,
@@ -131,6 +134,12 @@ class RobocorpAdapter(BaseAdapter):
     * RC_ROBOT_RUN_ID:          Control room robot run ID
 
     * RC_WORKITEM_ID:           Control room work item ID (input)
+
+    The adapter keeps track of the currently reserved (but not yet released)
+    work item, so interrupting the reserve-process-release cycle and retrying
+    it doesn't skip pending items nor releases them twice. Releasing an item
+    that was already released remotely (e.g. retried after a crash) is
+    tolerated and keeps the remotely stored state.
     """
 
     def __init__(self, *args, **kwargs):
@@ -141,6 +150,10 @@ class RobocorpAdapter(BaseAdapter):
         self._process_run_id = required_env("RC_PROCESS_RUN_ID")
         self._step_run_id = required_env("RC_ACTIVITY_RUN_ID")
         self._initial_item_id: Optional[str] = required_env("RC_WORKITEM_ID")
+        # ID of the work item reserved by this run, but not released yet. Kept
+        #  so an interrupted reserve-process-release cycle can be safely
+        #  retried without skipping or duplicating items.
+        self._reserved_item_id: Optional[str] = None
 
         self._workitem_requests = self._process_requests = None
         self._init_workitem_requests()
@@ -202,14 +215,25 @@ class RobocorpAdapter(BaseAdapter):
         return response.json()["workItemId"]
 
     def reserve_input(self) -> str:
+        if self._reserved_item_id:
+            # The previously reserved work item wasn't released (interrupted
+            #  before its processing finished), so return it again instead of
+            #  skipping it.
+            logging.info(
+                "Resuming with previously reserved work item: %s",
+                self._reserved_item_id,
+            )
+            return self._reserved_item_id
+
         if self._initial_item_id:
             item_id = self._initial_item_id
             self._initial_item_id = None
-            return item_id
+        else:
+            item_id = self._pop_item()
+            if not item_id:
+                raise EmptyQueue("No work items in the input queue")
 
-        item_id = self._pop_item()
-        if not item_id:
-            raise EmptyQueue("No work items in the input queue")
+        self._reserved_item_id = item_id
         return item_id
 
     def release_input(
@@ -243,7 +267,20 @@ class RobocorpAdapter(BaseAdapter):
             url,
             exception,
         )
-        self._process_requests.post(url, json=body)
+        try:
+            self._process_requests.post(url, json=body)
+        except RequestsHTTPError as exc:
+            if exc.status_code != 409:
+                raise
+            # The item was already released remotely (e.g. the release is
+            #  retried after an interruption), so keep the remotely stored
+            #  state and carry on instead of failing.
+            logging.warning(
+                "Work item %r was already released, keeping its remote state",
+                item_id,
+            )
+        if item_id == self._reserved_item_id:
+            self._reserved_item_id = None
 
     def create_output(self, parent_id: str, payload: Optional[JSONType] = None) -> str:
         # Putting "output" for the current input work item identified by `parent_id`.
@@ -366,10 +403,23 @@ class FileAdapter(BaseAdapter):
     Reads and writes all work item files from/to the same parent
     folder as the given input database.
 
+    The adapter persists every released input work item state inside the input
+    file itself, so a run interrupted at any point can be safely resumed by
+    just starting it again: already completed items are skipped, items failed
+    with a business error are considered settled, while items not yet released
+    (or failed with a transient application error) are reserved and processed
+    again. Output work items created by previous interrupted runs are loaded
+    back and reclaimed in order for retried inputs, so already confirmed
+    results are never lost nor duplicated. This behaviour is enabled by
+    default and can be turned off (restoring the previous always-restart one)
+    by setting the ``RPA_WORKITEMS_RESUME`` environment variable to a falsy
+    value (like ``0``).
+
     Optional environment variables:
 
     * RPA_INPUT_WORKITEM_PATH:  Path to work items input database file
     * RPA_OUTPUT_WORKITEM_PATH:  Path to work items output database file
+    * RPA_WORKITEMS_RESUME:  Falsy value disables resuming from persisted states
     """
 
     def __init__(self, *args, **kwargs):
@@ -378,9 +428,43 @@ class FileAdapter(BaseAdapter):
         self._input_path = UNDEFINED
         self._output_path = UNDEFINED
 
+        #: Whether interrupted runs are resumed from the persisted work item
+        #:  states (default) or every run starts over from the first item.
+        self._resume: bool = self._detect_resume()
+
         self.inputs: List[Dict[str, Any]] = self.load_database()
-        self.outputs: List[Dict[str, Any]] = []
-        self.index: int = 0
+        self.outputs: List[Dict[str, Any]] = (
+            self._load_outputs() if self._resume else []
+        )
+        #: Indices of output items created by previous (interrupted) runs,
+        #:  grouped by their parent input ID. Still available for being
+        #:  reclaimed in order, instead of appending duplicates, when the run
+        #:  producing them is retried.
+        self._reclaimable_outputs: Dict[str, Deque[int]] = defaultdict(deque)
+        for index, item in enumerate(self.outputs):
+            self._reclaimable_outputs[item.get("parentId")].append(index)
+
+    @staticmethod
+    def _detect_resume() -> bool:
+        value = os.getenv("RPA_WORKITEMS_RESUME", default="1")
+        return value.strip().lower() not in ("", "0", "false", "no", "off")
+
+    @staticmethod
+    def _is_pending(item: Dict[str, Any]) -> bool:
+        """Check if the input work `item` still needs processing.
+
+        Items confirmed as done or failed with a non-retryable business error
+        are considered settled, thus shouldn't be processed again.
+        """
+        state = item.get("state")
+        if state is None:
+            # Never released, either not processed yet or interrupted before
+            #  the release could happen.
+            return True
+        if state == State.DONE.value:
+            return False
+        exception = item.get("exception") or {}
+        return exception.get("type") != Error.BUSINESS.value
 
     def _get_item(self, item_id: str) -> Tuple[str, Dict[str, Any]]:
         # The work item ID is analogue to inputs/outputs list queues index.
@@ -394,18 +478,15 @@ class FileAdapter(BaseAdapter):
         raise ValueError(f"Unknown work item ID: {item_id}")
 
     def reserve_input(self) -> str:
-        if self.index >= len(self.inputs):
-            raise EmptyQueue("No work items in the input queue")
+        for idx, item in enumerate(self.inputs):
+            if self._is_pending(item):
+                return str(idx)
 
-        try:
-            return str(self.index)
-        finally:
-            self.index += 1
+        raise EmptyQueue("No work items in the input queue")
 
     def release_input(
         self, item_id: str, state: State, exception: Optional[dict] = None
     ):
-        # Nothing happens for now on releasing local dev input Work Items.
         log_func = logging.error if state == State.FAILED else logging.info
         log_func(
             "Releasing item %r with %s state and exception: %s",
@@ -413,6 +494,25 @@ class FileAdapter(BaseAdapter):
             state.value,
             exception,
         )
+
+        idx = int(item_id)
+        if idx < 0 or idx >= len(self.inputs):
+            raise ValueError(f"Unknown input work item ID: {item_id}")
+        item = self.inputs[idx]
+        item["state"] = state.value
+        if exception:
+            # Exclude `None` & empty string values.
+            item["exception"] = {
+                key: value for key, value in exception.items() if value
+            }
+
+        if not self._resume:
+            # States are kept in-memory only, so the next run starts over.
+            return
+        if self.input_path is None:
+            logging.debug("Can't persist work item state without an input path")
+            return
+        self._save_to_disk("input")
 
     @property
     def input_path(self) -> Optional[Path]:
@@ -477,13 +577,25 @@ class FileAdapter(BaseAdapter):
 
         logging.info("Saved into %s file: %s", source, path)
 
-    def create_output(self, _: str, payload: Optional[JSONType] = None) -> str:
-        # Note that the `parent_id` is not used during local development.
-        item: Dict[str, Any] = {"payload": payload, "files": {}}
-        self.outputs.append(item)
+    def create_output(self, parent_id: str, payload: Optional[JSONType] = None) -> str:
+        item: Dict[str, Any] = {
+            "payload": payload,
+            "files": {},
+            "parentId": parent_id,
+        }
+        reclaimable = self._reclaimable_outputs.get(parent_id)
+        if reclaimable:
+            # Reclaim the slot of an output created by a previous interrupted
+            #  run, so retrying the same input doesn't duplicate an already
+            #  saved result.
+            index = reclaimable.popleft()
+            self.outputs[index] = item
+        else:
+            self.outputs.append(item)
+            index = len(self.outputs) - 1
 
         self._save_to_disk("output")
-        return str(len(self.inputs) + len(self.outputs) - 1)  # new output work item ID
+        return str(len(self.inputs) + index)  # new output work item ID
 
     def load_payload(self, item_id: str) -> JSONType:
         _, item = self._get_item(item_id)
@@ -538,6 +650,37 @@ class FileAdapter(BaseAdapter):
         del files[name]
 
         self._save_to_disk(source)
+
+    def _load_outputs(self) -> List[Dict[str, Any]]:
+        """Load previously saved output work items if such file exists.
+
+        This way an interrupted run can be resumed without losing or
+        duplicating the outputs it already managed to create.
+        """
+        path: Optional[Path] = None
+        env_path = os.getenv("RPA_OUTPUT_WORKITEM_PATH")
+        if env_path:
+            path = resolve_path(env_path)
+        elif self.input_path:
+            path = self.input_path.with_suffix(".output.json")
+        if not path or not path.exists():
+            return []
+
+        try:
+            with open(path, "r", encoding=ENCODING) as infile:
+                data = json.load(infile)
+        except (OSError, ValueError) as exc:
+            logging.warning("Couldn't load output work items file %s: %s", path, exc)
+            return []
+
+        if not isinstance(data, list) or not all(isinstance(d, dict) for d in data):
+            logging.warning("Invalid output work items file format: %s", path)
+            return []
+
+        logging.info(
+            "Resuming with %d existing output work item(s) from: %s", len(data), path
+        )
+        return data
 
     def load_database(self) -> List:
         try:
@@ -640,14 +783,24 @@ class WorkItem:
         else:
             self.adapter.save_payload(self.id, self.payload)
 
-        for name in self._files_to_remove:
+        # File changes are applied (and dequeued) one by one, so interrupting
+        #  the save and retrying it later won't duplicate already confirmed
+        #  changes.
+        while self._files_to_remove:
+            name = self._files_to_remove[0]
             self.adapter.remove_file(self.id, name)
+            self._files_to_remove.pop(0)
+            if name in self._files:
+                self._files.remove(name)
 
-        for name, path in self._files_to_add.items():
+        for name, path in list(self._files_to_add.items()):
             with open(path, "rb") as infile:
                 self.adapter.add_file(
                     self.id, name, original_name=path.name, content=infile.read()
                 )
+            del self._files_to_add[name]
+            if name not in self._files:
+                self._files.append(name)
 
         # Empty unsaved values
         self._payload = self._payload_cache
@@ -828,6 +981,20 @@ class WorkItems:
 
     It is recommended to defer saves until all changes have been made to prevent
     leaving work items in a half-modified state in case of failures.
+
+    **Resuming interrupted runs**
+
+    The reserve-process-release cycle is designed to survive interruptions: a
+    work item is confirmed only when released, so a robot stopped in the middle
+    of processing can be safely started again. With the Control Room adapter,
+    an item reserved but not yet released is served again instead of being
+    skipped, and releasing an already released item is tolerated without
+    changing its remotely stored state. With the local ``FileAdapter``, item
+    states are persisted in the input file itself, so a restarted run skips
+    completed items, reserves again the interrupted or transiently failed ones
+    and reuses previously created outputs instead of duplicating them. (set the
+    ``RPA_WORKITEMS_RESUME`` environment variable to ``0`` for always starting
+    over)
 
     **Local Development**
 
@@ -1113,12 +1280,21 @@ class WorkItems:
 
         message = attributes["message"]
         logging.info("Releasing FAILED input item with APPLICATION error: %s", message)
-        self.release_input_work_item(
-            state=State.FAILED,
-            exception_type=Error.APPLICATION,
-            message=message,
-            _internal_release=True,
-        )
+        try:
+            self.release_input_work_item(
+                state=State.FAILED,
+                exception_type=Error.APPLICATION,
+                message=message,
+                _internal_release=True,
+            )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            # Don't mask the original failure with a release error. The item
+            #  remains un-released, so it gets safely retried later.
+            logging.warning(
+                "Couldn't release the failed input work item because of: %s"
+                " (release will be retried)",
+                exc,
+            )
 
     def _end_suite(self, _, attributes):
         """Robot Framework listener method, called when the suite ends."""
@@ -1180,6 +1356,10 @@ class WorkItems:
         If the library import argument ``autoload`` is truthy (default),
         this is called automatically when the Robot Framework suite
         starts.
+
+        If the previously reserved input work item wasn't released yet (e.g.
+        the run was interrupted before releasing it), the same item is
+        returned again instead of skipping ahead to the next one.
         """
         if not _internal_call:
             self._raise_under_iteration("Get Input Work Item")
@@ -1839,6 +2019,10 @@ class WorkItems:
         you encountered by specifying a type and optionally a code and/or message.
         After this has been called, no more output work items can be created
         unless a new input work item has been loaded again.
+
+        Releasing is idempotent: releasing an item that was already released
+        (e.g. retried after an interruption) doesn't fail nor change the
+        already confirmed state.
 
         :param state: The status on the last processed input work item
         :param exception_type: Error type (BUSINESS, APPLICATION). If this is not

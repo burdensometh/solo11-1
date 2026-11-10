@@ -27,13 +27,20 @@ Load mock library
 
     IF  ${first_item}
         Set Current Work Item     ${first_item}
-        ${work_items} =    Get Library Instance    RPA.Robocorp.WorkItems
-        ${namespace} =      Create Dictionary   adapter=${work_items.adapter}
-        Evaluate    setattr(adapter, "index", 1)   namespace=${namespace}
     ELSE
         ${item} =     Get Input Work Item  # because auto-load is disabled with this test
         Set Global Variable     ${first_item}   ${item}
     END
+
+
+Load fresh mock library
+    # Reset the adapter of the already imported library instance, so the work
+    #  items queue starts over from the fresh copy of the input file.
+    OS.Copy file    ${RESOURCES}/items.json    ${temp_in}
+    Set environment variable    RPA_INPUT_WORKITEM_PATH    ${temp_in}
+    Set environment variable    RPA_OUTPUT_WORKITEM_PATH    ${temp_out}
+    ${work_items} =     Get Library Instance    RPA.Robocorp.WorkItems
+    Evaluate    setattr($work_items, "_adapter", None)
 
 
 Log Payload
@@ -107,7 +114,9 @@ Consume queue with and without results
     # Since the first item might be released already or not.
     Run Keyword And Ignore Error    Release Input Work Item     DONE
 
-    @{expected_results} =   Create List     ${4}    ${2}
+    # Only the last input item is still pending at this point, the previously
+    #  processed ones are skipped on reservation.
+    @{expected_results} =   Create List     ${2}
     ${results} =     For Each Input Work Item    Log Payload    return_results=${True}      items_limit=${2}
     Should Be Equal     ${results}      ${expected_results}
 
@@ -116,6 +125,9 @@ Consume queue with and without results
 
 
 Get payload given e-mail process triggering
+    [Setup]     Load fresh mock library
+
+    Get Input Work Item
     ${parsed_email} =    Get Work Item Variable    parsedEmail
     Set Work Item Variables    &{parsed_email}[Body]
     Save Work Item

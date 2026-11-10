@@ -12,7 +12,15 @@ Latest versions
 `Upcoming release <https://github.com/robocorp/rpaframework/projects/3#column-16713994>`_
 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
-No changes planned yet for the next release.
+- ``RPA.Robocorp.WorkItems``: the reserve-process-release cycle now survives
+  interruptions, so long-running robots can be safely restarted. A work item reserved
+  but not yet released is served again instead of being skipped, releasing an already
+  released item no longer fails (the already confirmed state is kept) and retrying an
+  interrupted ``Save Work Item`` doesn't duplicate already uploaded files. With the
+  local ``FileAdapter``, released item states are persisted in the input file and
+  previously created outputs are reused instead of duplicated, so a restarted run
+  continues where it stopped (restore the old always-restart behaviour with the
+  ``RPA_WORKITEMS_RESUME=0`` environment variable).
 
 `Released <https://pypi.org/project/rpaframework/#history>`_
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
